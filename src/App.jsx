@@ -256,15 +256,91 @@ function makeScatterTrace(points, name, color, size = 8) {
 // Change this to your actual backend URL when ready
 const API_BASE = "http://localhost:8000";
 
+async function uploadFasta(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(`${API_BASE}/uploads`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || "Upload failed");
+  }
+  return response.json();
+}
+
+async function submitJob(model, inputFileId) {
+  const response = await fetch(`${API_BASE}/jobs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, input_file_id: inputFileId }),
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || "Job submission failed");
+  }
+  return response.json();
+}
+
+async function fetchJobStatus(jobId) {
+  const response = await fetch(`${API_BASE}/jobs/${jobId}`);
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || "Failed to fetch job status");
+  }
+  return response.json();
+}
+
+async function fetchJobResult(jobId) {
+  const response = await fetch(`${API_BASE}/jobs/${jobId}/result`);
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || "Failed to fetch job result");
+  }
+  return response.json();
+}
+
+const buildFileUrl = (path) =>
+  path ? `${API_BASE}/files?path=${encodeURIComponent(path)}` : null;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function uploadSubmitAndWait(file, model) {
+  const upload = await uploadFasta(file);
+  const submit = await submitJob(model, upload.job_id);
+  let status = await fetchJobStatus(submit.job_id);
+  let attempts = 0;
+  while (status.status !== "completed" && status.status !== "failed") {
+    if (attempts > 20) {
+      throw new Error("Job timed out");
+    }
+    await sleep(500);
+    status = await fetchJobStatus(submit.job_id);
+    attempts += 1;
+  }
+  if (status.status === "failed") {
+    throw new Error(status.error || "Job failed");
+  }
+  const result = await fetchJobResult(submit.job_id);
+  return {
+    jobId: submit.job_id,
+    resultPath: result.result_path,
+    imagePath: result.image_path,
+  };
+}
+
 // ─── Upload & Run Section Component ─────────────────────────────────────────
 
-function UploadRunSection() {
+function UploadRunSection({ onResults }) {
   const [files, setFiles] = useState([]);
   const [selectedModel, setSelectedModel] = useState("both");
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(0);
   const [results, setResults] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [jobIds, setJobIds] = useState([]);
+  const [useMock, setUseMock] = useState(true);
   const fileInputRef = useRef(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -333,6 +409,7 @@ function UploadRunSection() {
       setStatus("uploaded");
       setResults(null);
       setProgress(0);
+      setJobIds([]);
     }
   };
 
@@ -356,36 +433,114 @@ function UploadRunSection() {
   const handleRun = async () => {
     if (files.length === 0) return;
     try {
+      setErrorMsg("");
       setProgress(5);
-      if (runUnirep) {
-        setStatus("running_unirep");
-        setProgress(10);
-        for (let i = 0; i < files.length; i++) {
-          await new Promise((r) => setTimeout(r, 300 + Math.random() * 200));
-          setProgress(
-            10 + Math.round(((i + 1) / files.length) * (runEsm2 ? 40 : 85))
-          );
+      setJobIds([]);
+      setResults(null);
+
+      if (useMock) {
+        if (runUnirep) {
+          setStatus("running_unirep");
+          setProgress(10);
+          for (let i = 0; i < files.length; i++) {
+            await new Promise((r) => setTimeout(r, 300 + Math.random() * 200));
+            setProgress(
+              10 + Math.round(((i + 1) / files.length) * (runEsm2 ? 40 : 85))
+            );
+          }
         }
-      }
-      if (runEsm2) {
-        setStatus("running_esm2");
-        if (!runUnirep) setProgress(10);
-        for (let i = 0; i < files.length; i++) {
-          await new Promise((r) => setTimeout(r, 100 + Math.random() * 100));
-          setProgress(
-            (runUnirep ? 50 : 10) +
-              Math.round(((i + 1) / files.length) * (runUnirep ? 45 : 85))
-          );
+        if (runEsm2) {
+          setStatus("running_esm2");
+          if (!runUnirep) setProgress(10);
+          for (let i = 0; i < files.length; i++) {
+            await new Promise((r) => setTimeout(r, 100 + Math.random() * 100));
+            setProgress(
+              (runUnirep ? 50 : 10) +
+                Math.round(((i + 1) / files.length) * (runUnirep ? 45 : 85))
+            );
+          }
         }
+        setProgress(100);
+        setStatus("complete");
+        const perFile = files.map((f) => {
+          const base = f.name.replace(/\.\w+$/, "");
+          return {
+            name: f.name,
+            unirep_h5: runUnirep ? `${base}_unirep_1900.h5` : null,
+            esm2_h5: runEsm2 ? `${base}_esm2_1280.h5` : null,
+            unirep_image_url: runUnirep
+              ? "https://placehold.co/600x400/png?text=UniRep+t-SNE"
+              : null,
+            esm2_image_url: runEsm2
+              ? "https://placehold.co/600x400/png?text=ESM-2+t-SNE"
+              : null,
+          };
+        });
+        setResults(perFile);
+      onResults?.(perFile);
+      onResults?.(perFile);
+        onResults?.(perFile);
+        return;
       }
+
+      const perFileResults = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (runUnirep) {
+          setStatus("running_unirep");
+        } else {
+          setStatus("running_esm2");
+        }
+        setProgress(
+          10 + Math.round(((i + 1) / files.length) * (runEsm2 ? 40 : 85))
+        );
+
+        const jobResults = [];
+        if (runUnirep) {
+          const unirep = await uploadSubmitAndWait(file, "unirep");
+          jobResults.push({ ...unirep, model: "unirep" });
+        }
+        if (runEsm2) {
+          if (runUnirep) {
+            setStatus("running_esm2");
+          }
+          const esm2 = await uploadSubmitAndWait(file, "esm2");
+          jobResults.push({ ...esm2, model: "esm2" });
+        }
+
+        perFileResults.push({ file, jobResults });
+        setProgress(
+          (runUnirep ? 50 : 10) +
+            Math.round(((i + 1) / files.length) * (runUnirep ? 45 : 85))
+        );
+      }
+
       setProgress(100);
       setStatus("complete");
-      const perFile = files.map((f) => {
-        const base = f.name.replace(/\.\w+$/, "");
+
+      const aggregatedJobIds = perFileResults.flatMap((entry) =>
+        entry.jobResults.map((result) => result.jobId)
+      );
+      setJobIds(aggregatedJobIds);
+
+      const perFile = perFileResults.map(({ file, jobResults }) => {
+        const base = file.name.replace(/\.\w+$/, "");
+        const unirepResult = jobResults.find((r) => r.model === "unirep");
+        const esm2Result = jobResults.find((r) => r.model === "esm2");
         return {
-          name: f.name,
+          name: file.name,
           unirep_h5: runUnirep ? `${base}_unirep_1900.h5` : null,
           esm2_h5: runEsm2 ? `${base}_esm2_1280.h5` : null,
+          unirep_job_id: unirepResult?.jobId || null,
+          esm2_job_id: esm2Result?.jobId || null,
+          unirep_result_path: unirepResult?.resultPath || null,
+          esm2_result_path: esm2Result?.resultPath || null,
+          unirep_image_url: unirepResult?.imagePath
+            ? buildFileUrl(unirepResult.imagePath)
+            : null,
+          esm2_image_url: esm2Result?.imagePath
+            ? buildFileUrl(esm2Result.imagePath)
+            : null,
         };
       });
       setResults(perFile);
@@ -395,10 +550,33 @@ function UploadRunSection() {
     }
   };
 
-  const handleDownload = (fileName) => {
-    alert(
-      `Download ${fileName}\n(Mock — connect backend to enable real downloads)`
-    );
+  const handleDownload = async (fileName, resultPath) => {
+    if (!resultPath) {
+      alert("Result not ready yet.");
+      return;
+    }
+    const url = buildFileUrl(resultPath);
+    if (!url) {
+      alert("Invalid download URL");
+      return;
+    }
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error("Failed to download file");
+      }
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = fileName || "result.h5";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      alert(error.message || "Failed to download file");
+    }
   };
   const handleReset = () => {
     setFiles([]);
@@ -406,6 +584,7 @@ function UploadRunSection() {
     setProgress(0);
     setResults(null);
     setErrorMsg("");
+    setJobIds([]);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -644,6 +823,55 @@ function UploadRunSection() {
             </div>
           </div>
 
+          <div>
+            <div
+              style={{
+                fontSize: 16,
+                color: "#64748b",
+                marginBottom: 8,
+                letterSpacing: "0.05em",
+                textTransform: "uppercase",
+              }}
+            >
+              Mode
+            </div>
+            <div
+              style={{
+                display: "flex",
+                gap: 0,
+                background: "#ffffff",
+                borderRadius: 10,
+                overflow: "hidden",
+                border: "1px solid #e2e8f0",
+                width: "fit-content",
+              }}
+            >
+              {[
+                { key: true, label: "Mock" },
+                { key: false, label: "Live API" },
+              ].map(({ key, label }) => (
+                <button
+                  key={label}
+                  onClick={() => setUseMock(key)}
+                  disabled={isRunning}
+                  style={{
+                    padding: "10px 20px",
+                    fontSize: 17,
+                    fontFamily: "'JetBrains Mono', monospace",
+                    color: useMock === key ? "#0284c7" : "#94a3b8",
+                    background: useMock === key ? "#f0f9ff" : "#ffffff",
+                    border: "none",
+                    cursor: isRunning ? "not-allowed" : "pointer",
+                    transition: "all 0.2s",
+                    fontWeight: useMock === key ? 600 : 400,
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div style={{ display: "flex", gap: 12 }}>
             <button
               onClick={handleRun}
@@ -862,7 +1090,9 @@ function UploadRunSection() {
                   </div>
                   {r.unirep_h5 && (
                     <div
-                      onClick={() => handleDownload(r.unirep_h5)}
+                      onClick={() =>
+                        handleDownload(r.unirep_h5, r.unirep_result_path)
+                      }
                       style={{
                         background: "#ffffff",
                         border: "1px solid #fde68a",
@@ -906,6 +1136,17 @@ function UploadRunSection() {
                         >
                           UniRep mLSTM · 1900-dim
                         </div>
+                        {r.unirep_job_id && (
+                          <div
+                            style={{
+                              fontSize: 12,
+                              color: "#d97706",
+                              marginTop: 4,
+                            }}
+                          >
+                            Job ID: {r.unirep_job_id}
+                          </div>
+                        )}
                       </div>
                       <span
                         style={{
@@ -920,7 +1161,7 @@ function UploadRunSection() {
                   )}
                   {r.esm2_h5 && (
                     <div
-                      onClick={() => handleDownload(r.esm2_h5)}
+                      onClick={() => handleDownload(r.esm2_h5, r.esm2_result_path)}
                       style={{
                         background: "#ffffff",
                         border: "1px solid #bfdbfe",
@@ -963,6 +1204,17 @@ function UploadRunSection() {
                         >
                           ESM-2 Transformer · 1280-dim
                         </div>
+                        {r.esm2_job_id && (
+                          <div
+                            style={{
+                              fontSize: 12,
+                              color: "#2563eb",
+                              marginTop: 4,
+                            }}
+                          >
+                            Job ID: {r.esm2_job_id}
+                          </div>
+                        )}
                       </div>
                       <span
                         style={{
@@ -990,6 +1242,7 @@ function UploadRunSection() {
 
 export default function ProteinDashboard() {
   const [activeProteinMode, setActiveProteinMode] = useState("single");
+  const [latestResults, setLatestResults] = useState([]);
 
   const nonReproPlotData = [
     makeScatterTrace(NON_REPRO_RUN1, "Run 1", PLOT_COLORS.run1),
@@ -1008,6 +1261,11 @@ export default function ProteinDashboard() {
     makeScatterTrace(ESM_DATA, "Run 2", PLOT_COLORS.run2, 6),
     makeScatterTrace(ESM_DATA, "Run 3", PLOT_COLORS.run3, 4),
   ];
+
+  const latestUnirepImage =
+    latestResults.find((r) => r.unirep_image_url)?.unirep_image_url || null;
+  const latestEsmImage =
+    latestResults.find((r) => r.esm2_image_url)?.esm2_image_url || null;
 
   const speedMode = activeProteinMode === "single" ? "single" : "multi100";
   const speedPlotData = [
@@ -1152,7 +1410,7 @@ export default function ProteinDashboard() {
       </header>
 
       {/* ── Upload & Run Section ── */}
-      <UploadRunSection />
+      <UploadRunSection onResults={setLatestResults} />
 
       {/* ── Section 1: Reproducibility ── */}
       <section
@@ -1220,15 +1478,30 @@ export default function ProteinDashboard() {
                 DETERMINISTIC
               </span>
             </div>
-            <PlotlyScatter
-              id="repro-tsne"
-              data={reproPlotData}
-              layout={{
-                ...LIGHT_LAYOUT,
-                title: plotTitle("t-SNE — All runs overlap"),
-              }}
-              style={{ width: "100%", height: 400 }}
-            />
+            {latestUnirepImage ? (
+              <img
+                src={latestUnirepImage}
+                alt="UniRep t-SNE"
+                style={{
+                  width: "100%",
+                  height: 400,
+                  objectFit: "cover",
+                  borderRadius: 12,
+                  border: "1px solid #fef3c7",
+                  marginTop: 12,
+                }}
+              />
+            ) : (
+              <PlotlyScatter
+                id="repro-tsne"
+                data={reproPlotData}
+                layout={{
+                  ...LIGHT_LAYOUT,
+                  title: plotTitle("t-SNE — All runs overlap"),
+                }}
+                style={{ width: "100%", height: 400 }}
+              />
+            )}
           </div>
 
           {/* ESM-2 */}
@@ -1277,15 +1550,30 @@ export default function ProteinDashboard() {
                 DETERMINISTIC
               </span>
             </div>
-            <PlotlyScatter
-              id="esm-tsne"
-              data={esmPlotData}
-              layout={{
-                ...LIGHT_LAYOUT,
-                title: plotTitle("t-SNE — All runs identical"),
-              }}
-              style={{ width: "100%", height: 400 }}
-            />
+            {latestEsmImage ? (
+              <img
+                src={latestEsmImage}
+                alt="ESM-2 t-SNE"
+                style={{
+                  width: "100%",
+                  height: 400,
+                  objectFit: "cover",
+                  borderRadius: 12,
+                  border: "1px solid #bfdbfe",
+                  marginTop: 12,
+                }}
+              />
+            ) : (
+              <PlotlyScatter
+                id="esm-tsne"
+                data={esmPlotData}
+                layout={{
+                  ...LIGHT_LAYOUT,
+                  title: plotTitle("t-SNE — All runs identical"),
+                }}
+                style={{ width: "100%", height: 400 }}
+              />
+            )}
           </div>
         </div>
         <p
